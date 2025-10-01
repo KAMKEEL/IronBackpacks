@@ -1,7 +1,6 @@
 package main.ironbackpacks.events;
 
 import cpw.mods.fml.client.event.ConfigChangedEvent;
-import cpw.mods.fml.common.eventhandler.Event;
 import cpw.mods.fml.common.eventhandler.EventPriority;
 import cpw.mods.fml.common.eventhandler.SubscribeEvent;
 import cpw.mods.fml.common.registry.GameRegistry;
@@ -9,19 +8,21 @@ import main.ironbackpacks.IronBackpacks;
 import main.ironbackpacks.ModInformation;
 import main.ironbackpacks.container.backpack.ContainerBackpack;
 import main.ironbackpacks.container.backpack.InventoryBackpack;
+import main.ironbackpacks.handlers.ConfigHandler;
 import main.ironbackpacks.items.backpacks.BackpackTypes;
 import main.ironbackpacks.items.backpacks.IBackpack;
 import main.ironbackpacks.items.backpacks.ItemBackpack;
 import main.ironbackpacks.items.upgrades.UpgradeMethods;
-import main.ironbackpacks.handlers.ConfigHandler;
 import main.ironbackpacks.util.IronBackpacksHelper;
 import main.ironbackpacks.util.Logger;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.inventory.ContainerWorkbench;
 import net.minecraft.inventory.InventoryCrafting;
 import net.minecraft.inventory.Slot;
+import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.crafting.CraftingManager;
+import net.minecraft.nbt.NBTTagCompound;
 import net.minecraftforge.event.entity.EntityJoinWorldEvent;
 import net.minecraftforge.event.entity.living.LivingDeathEvent;
 import net.minecraftforge.event.entity.player.EntityItemPickupEvent;
@@ -29,11 +30,23 @@ import net.minecraftforge.event.entity.player.PlayerUseItemEvent;
 import net.minecraftforge.oredict.OreDictionary;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * All the events used that fire on the Forge Event bus
  */
 public class ForgeEventHandler {
+
+    private static final int PLAYER_INVENTORY_SIZE = 36;
+    private static final BackpackTypes[] BACKPACK_TYPES = BackpackTypes.values();
+    private static final Map<ItemStackKey, String> MOD_ID_CACHE = new HashMap<ItemStackKey, String>();
+    private static final Map<ItemStackKey, List<String>> ORE_DICT_CACHE = new HashMap<ItemStackKey, List<String>>();
+    private static final Set<ItemStackKey> EMPTY_ORE_DICT_CACHE = new HashSet<ItemStackKey>();
+    private static final Map<RecipeKey, ItemStack> RECIPE_CACHE = new HashMap<RecipeKey, ItemStack>();
 
     /**
      * Called whenever an item is picked up by a player. The basis for all the filters, and the event used for the hopper/restocking and condenser/crafting upgrades too so it doesn't check too much and causes lag..
@@ -146,7 +159,11 @@ public class ForgeEventHandler {
 
             if (UpgradeMethods.hasDepthUpgrade(upgrades)) {
                 ItemBackpack itemBackpack = (ItemBackpack)backpack.getItem();
-                ContainerBackpack container = new ContainerBackpack(player, new InventoryBackpack(player, backpack, BackpackTypes.values()[itemBackpack.getId()-1]), BackpackTypes.values()[itemBackpack.getId()-1]);  //-1 as getId is 1-4 whereas values is 0-3
+                BackpackTypes nestedType = getBackpackTypeByItemId(itemBackpack.getId());
+                if (nestedType == null) {
+                    return;
+                }
+                ContainerBackpack container = new ContainerBackpack(player, new InventoryBackpack(player, backpack, nestedType), nestedType);
                 for (int j = 0; j < container.getInventoryBackpack().getSizeInventory(); j++) {
                     ItemStack nestedBackpack = container.getInventoryBackpack().getStackInSlot(j);
                     if (nestedBackpack != null && nestedBackpack.getItem() != null && nestedBackpack.getItem() instanceof IBackpack) {
@@ -188,84 +205,86 @@ public class ForgeEventHandler {
      */
     private boolean checkHopperUpgradeItemPickup(EntityItemPickupEvent event, ArrayList<ItemStack> backpackStacks){
         boolean doFilter = true;
-        boolean shouldSave = false;
         if (!backpackStacks.isEmpty()){
             for (ItemStack backpack : backpackStacks) {
-                shouldSave = false;
-                BackpackTypes type = BackpackTypes.values()[((ItemBackpack) backpack.getItem()).getGuiId()];
+                if (isBackpackContainerOpen(event.entityPlayer) || isItemEntityEmpty(event)) {
+                    continue;
+                }
+                BackpackTypes type = getBackpackType(backpack);
+                if (type == null) {
+                    continue;
+                }
                 ContainerBackpack container = new ContainerBackpack(event.entityPlayer, new InventoryBackpack(event.entityPlayer, backpack, type), type);
-                if (!(event.entityPlayer.openContainer instanceof ContainerBackpack)) { //can't have the backpack open
-                    container.sort(); //TODO: test with this removed
-                    ArrayList<ItemStack> hopperItems = UpgradeMethods.getHopperItems(backpack);
-                    for (ItemStack hopperItem : hopperItems) {
-                        if (hopperItem != null) {
+                container.sort(); //TODO: test with this removed
+                ArrayList<ItemStack> hopperItems = UpgradeMethods.getHopperItems(backpack);
+                boolean shouldSave = false;
+                for (ItemStack hopperItem : hopperItems) {
+                    if (hopperItem == null) {
+                        continue;
+                    }
 
-                            boolean foundSlot = false;
-                            ItemStack stackToResupply = null;
-                            Slot slotToResupply = null;
+                    Slot slotToResupply = null;
+                    ItemStack stackToResupply = null;
 
-                            for (int i = type.getSize(); i < type.getSize() + 36; i++){ //check player's inv for item
-                                Slot tempSlot = (Slot) container.getSlot(i);
-                                if (tempSlot!= null && tempSlot.getHasStack()){
-                                    ItemStack tempItem = tempSlot.getStack();
-                                    if (IronBackpacksHelper.areItemsEqualAndStackable(tempItem, hopperItem)){ //found and less than max stack size
-                                        foundSlot = true;
-                                        slotToResupply = tempSlot;
-                                        stackToResupply = tempItem;
-                                        break;
-                                    }
-                                }
+                    for (int i = type.getSize(); i < type.getSize() + PLAYER_INVENTORY_SIZE; i++){ //check player's inv for item
+                        Slot tempSlot = (Slot) container.getSlot(i);
+                        if (tempSlot != null && tempSlot.getHasStack()){
+                            ItemStack tempItem = tempSlot.getStack();
+                            if (IronBackpacksHelper.areItemsEqualAndStackable(tempItem, hopperItem)){ //found and less than max stack size
+                                slotToResupply = tempSlot;
+                                stackToResupply = tempItem;
+                                break;
                             }
+                        }
+                    }
 
-                            if (foundSlot){ //try to resupply with the itemEntity first
-                                boolean done = false;
-                                if (IronBackpacksHelper.areItemsEqualForStacking(event.item.getEntityItem(), stackToResupply)){
-                                    int amountToResupply = stackToResupply.getMaxStackSize() - stackToResupply.stackSize;
-                                    if (event.item.getEntityItem().stackSize >= amountToResupply) { //if larger size of stack on the ground than needed to resupply
-                                        event.item.setEntityItemStack(new ItemStack(event.item.getEntityItem().getItem(), event.item.getEntityItem().stackSize - amountToResupply, event.item.getEntityItem().getItemDamage()));
-                                        slotToResupply.putStack(new ItemStack(stackToResupply.getItem(), stackToResupply.getMaxStackSize(), stackToResupply.getItemDamage()));
-                                        done = true;
-                                        shouldSave = true;
-                                    }else { //just resupply what you can, it will automatically go into the player's slot needed
-                                        doFilter = false;
-                                    }
-                                }
-                                if (!done) { //then resupply from the backpack (if necessary)
-                                    for (int i = 0; i < type.getSize(); i++) {
-                                        Slot tempSlot = (Slot) container.getSlot(i);
-                                        if (tempSlot != null && tempSlot.getHasStack()) {
-                                            ItemStack tempItem = tempSlot.getStack();
-                                            if (IronBackpacksHelper.areItemsEqualForStacking(tempItem, stackToResupply)) {
-                                                int amountToResupply;
-                                                if (IronBackpacksHelper.areItemsEqualForStacking(event.item.getEntityItem(), stackToResupply)) {
-                                                    amountToResupply = stackToResupply.getMaxStackSize() - stackToResupply.stackSize - event.item.getEntityItem().stackSize;
-                                                    if (tempItem.stackSize >= amountToResupply) {
-                                                        tempSlot.decrStackSize(amountToResupply);
-                                                        slotToResupply.putStack(new ItemStack(stackToResupply.getItem(), stackToResupply.getMaxStackSize() - event.item.getEntityItem().stackSize, stackToResupply.getItemDamage()));
-                                                        container.sort();
-                                                        container.onContainerClosed(event.entityPlayer);
-                                                        break;
-                                                    } else {
-                                                        tempSlot.decrStackSize(tempItem.stackSize);
-                                                        slotToResupply.putStack(new ItemStack(stackToResupply.getItem(), stackToResupply.stackSize + tempItem.stackSize, stackToResupply.getItemDamage()));
-                                                    }
-                                                }else{
-                                                    amountToResupply = stackToResupply.getMaxStackSize() - stackToResupply.stackSize;
-                                                    if (tempItem.stackSize >= amountToResupply) {
-                                                        tempSlot.decrStackSize(amountToResupply);
-                                                        slotToResupply.putStack(new ItemStack(stackToResupply.getItem(), stackToResupply.getMaxStackSize(), stackToResupply.getItemDamage()));
-                                                        container.sort();
-                                                        container.onContainerClosed(event.entityPlayer);
-                                                        break;
-                                                    } else {
-                                                        tempSlot.decrStackSize(tempItem.stackSize);
-                                                        slotToResupply.putStack(new ItemStack(stackToResupply.getItem(), stackToResupply.stackSize + tempItem.stackSize, stackToResupply.getItemDamage()));
-                                                    }
-                                                }
-                                                shouldSave = true;
-                                            }
+                    if (slotToResupply == null){
+                        continue;
+                    }
+
+                    boolean done = false;
+                    if (IronBackpacksHelper.areItemsEqualForStacking(event.item.getEntityItem(), stackToResupply)){
+                        int amountToResupply = stackToResupply.getMaxStackSize() - stackToResupply.stackSize;
+                        if (event.item.getEntityItem().stackSize >= amountToResupply) { //if larger size of stack on the ground than needed to resupply
+                            event.item.setEntityItemStack(new ItemStack(event.item.getEntityItem().getItem(), event.item.getEntityItem().stackSize - amountToResupply, event.item.getEntityItem().getItemDamage()));
+                            slotToResupply.putStack(new ItemStack(stackToResupply.getItem(), stackToResupply.getMaxStackSize(), stackToResupply.getItemDamage()));
+                            done = true;
+                            shouldSave = true;
+                        }else { //just resupply what you can, it will automatically go into the player's slot needed
+                            doFilter = false;
+                        }
+                    }
+                    if (!done) { //then resupply from the backpack (if necessary)
+                        for (int i = 0; i < type.getSize(); i++) {
+                            Slot tempSlot = (Slot) container.getSlot(i);
+                            if (tempSlot != null && tempSlot.getHasStack()) {
+                                ItemStack tempItem = tempSlot.getStack();
+                                if (IronBackpacksHelper.areItemsEqualForStacking(tempItem, stackToResupply)) {
+                                    int amountToResupply;
+                                    if (IronBackpacksHelper.areItemsEqualForStacking(event.item.getEntityItem(), stackToResupply)) {
+                                        amountToResupply = stackToResupply.getMaxStackSize() - stackToResupply.stackSize - event.item.getEntityItem().stackSize;
+                                        if (tempItem.stackSize >= amountToResupply) {
+                                            tempSlot.decrStackSize(amountToResupply);
+                                            slotToResupply.putStack(new ItemStack(stackToResupply.getItem(), stackToResupply.getMaxStackSize() - event.item.getEntityItem().stackSize, stackToResupply.getItemDamage()));
+                                            shouldSave = true;
+                                            break;
+                                        } else {
+                                            tempSlot.decrStackSize(tempItem.stackSize);
+                                            slotToResupply.putStack(new ItemStack(stackToResupply.getItem(), stackToResupply.stackSize + tempItem.stackSize, stackToResupply.getItemDamage()));
+                                        }
+                                    }else{
+                                        amountToResupply = stackToResupply.getMaxStackSize() - stackToResupply.stackSize;
+                                        if (tempItem.stackSize >= amountToResupply) {
+                                            tempSlot.decrStackSize(amountToResupply);
+                                            slotToResupply.putStack(new ItemStack(stackToResupply.getItem(), stackToResupply.getMaxStackSize(), stackToResupply.getItemDamage()));
+                                            shouldSave = true;
+                                            break;
+                                        } else {
+                                            tempSlot.decrStackSize(tempItem.stackSize);
+                                            slotToResupply.putStack(new ItemStack(stackToResupply.getItem(), stackToResupply.stackSize + tempItem.stackSize, stackToResupply.getItemDamage()));
                                         }
                                     }
+                                    shouldSave = true;
                                 }
                             }
                         }
@@ -274,7 +293,6 @@ public class ForgeEventHandler {
                 if (shouldSave) {
                     container.sort(); //TODO: test and add to other events (add boolean so that it doesn't save when nothing changes)
                     container.onContainerClosed(event.entityPlayer);
-                    shouldSave = false;
                 }
             }
         }
@@ -295,63 +313,65 @@ public class ForgeEventHandler {
     private ItemStack checkHopperUpgradeItemUse(PlayerUseItemEvent.Finish event, ArrayList<ItemStack> backpackStacks){
         if (!backpackStacks.isEmpty()){
             for (ItemStack backpack : backpackStacks) {
-                BackpackTypes type = BackpackTypes.values()[((ItemBackpack) backpack.getItem()).getGuiId()];
+                if (event.item == null || isBackpackContainerOpen(event.entityPlayer)) {
+                    continue;
+                }
+                BackpackTypes type = getBackpackType(backpack);
+                if (type == null) {
+                    continue;
+                }
                 ContainerBackpack container = new ContainerBackpack(event.entityPlayer, new InventoryBackpack(event.entityPlayer, backpack, type), type);
-                if (!(event.entityPlayer.openContainer instanceof ContainerBackpack)) { //can't have the backpack open
-                    container.sort(); //TODO: test with this removed
-                    ArrayList<ItemStack> hopperItems = UpgradeMethods.getHopperItems(backpack);
-                    for (ItemStack hopperItem : hopperItems) {
-                        if (hopperItem != null) {
+                container.sort(); //TODO: test with this removed
+                ArrayList<ItemStack> hopperItems = UpgradeMethods.getHopperItems(backpack);
+                for (ItemStack hopperItem : hopperItems) {
+                    if (hopperItem == null || !IronBackpacksHelper.areItemsEqualForStacking(event.item, hopperItem)) {
+                        continue;
+                    }
 
-                            boolean foundSlot = false;
-                            ItemStack stackToResupply = null;
-                            Slot slotToResupply = null;
+                    Slot slotToResupply = null;
+                    ItemStack stackToResupply = null;
 
-                            for (int i = type.getSize(); i < type.getSize() + 36; i++){ //check player's inv for item (backpack size + 36 for player inv)
-                                Slot tempSlot = (Slot) container.getSlot(i);
-                                if (tempSlot!= null && tempSlot.getHasStack()){
-                                    ItemStack tempItem = tempSlot.getStack();
-                                    if (IronBackpacksHelper.areItemsEqualForStacking(event.item, hopperItem) //has to be same item as what was used in the event
-                                            && IronBackpacksHelper.areItemsEqualAndStackable(tempItem, hopperItem)){ //found and less than max stack size
-                                        foundSlot = true;
-                                        slotToResupply = tempSlot;
-                                        stackToResupply = tempItem;
-                                        break;
-                                    }
-                                }
+                    for (int i = type.getSize(); i < type.getSize() + PLAYER_INVENTORY_SIZE; i++){ //check player's inv for item (backpack size + 36 for player inv)
+                        Slot tempSlot = (Slot) container.getSlot(i);
+                        if (tempSlot!= null && tempSlot.getHasStack()){
+                            ItemStack tempItem = tempSlot.getStack();
+                            if (IronBackpacksHelper.areItemsEqualAndStackable(tempItem, hopperItem)){ //found and less than max stack size
+                                slotToResupply = tempSlot;
+                                stackToResupply = tempItem;
+                                break;
                             }
+                        }
+                    }
 
-                            if (foundSlot){ // resupply from the backpack
-                                for (int i = 0; i < type.getSize(); i++) {
-                                    Slot backpackSlot = (Slot) container.getSlot(i);
-                                    if (backpackSlot != null && backpackSlot.getHasStack()) {
-                                        ItemStack backpackItemStack = backpackSlot.getStack();
+                    if (slotToResupply == null){
+                        continue;
+                    }
 
-                                        if (IronBackpacksHelper.areItemsEqualForStacking(stackToResupply, backpackItemStack)) {
-                                            int amountToResupply = stackToResupply.getMaxStackSize() - stackToResupply.stackSize;
+                    for (int i = 0; i < type.getSize(); i++) {
+                        Slot backpackSlot = (Slot) container.getSlot(i);
+                        if (backpackSlot != null && backpackSlot.getHasStack()) {
+                            ItemStack backpackItemStack = backpackSlot.getStack();
 
-                                            if (backpackItemStack.stackSize >= amountToResupply) {
-                                                backpackSlot.decrStackSize(amountToResupply);
-                                                container.sort();
-                                                container.onContainerClosed(event.entityPlayer);
-                                                return (new ItemStack(stackToResupply.getItem(), stackToResupply.getMaxStackSize(), stackToResupply.getItemDamage()));
+                            if (IronBackpacksHelper.areItemsEqualForStacking(stackToResupply, backpackItemStack)) {
+                                int amountToResupply = stackToResupply.getMaxStackSize() - stackToResupply.stackSize;
 
-                                            } else {
-                                                backpackSlot.decrStackSize(backpackItemStack.stackSize);
-                                                container.sort();
-                                                container.onContainerClosed(event.entityPlayer);
-                                                return (new ItemStack(stackToResupply.getItem(), stackToResupply.stackSize + backpackItemStack.stackSize, stackToResupply.getItemDamage()));
-                                                //don't have to iterate
-                                                //b/c once sorted you have as big of a stack as you will ever have so it can only refill that much
-                                            }
-                                        }
-                                    }
+                                if (backpackItemStack.stackSize >= amountToResupply) {
+                                    backpackSlot.decrStackSize(amountToResupply);
+                                    container.sort();
+                                    container.onContainerClosed(event.entityPlayer);
+                                    return (new ItemStack(stackToResupply.getItem(), stackToResupply.getMaxStackSize(), stackToResupply.getItemDamage()));
+
+                                } else {
+                                    backpackSlot.decrStackSize(backpackItemStack.stackSize);
+                                    container.sort();
+                                    container.onContainerClosed(event.entityPlayer);
+                                    return (new ItemStack(stackToResupply.getItem(), stackToResupply.stackSize + backpackItemStack.stackSize, stackToResupply.getItemDamage()));
                                 }
                             }
                         }
                     }
-                } //no save b/c returns and saves if it does anything
-            }
+                }
+            } //no save b/c returns and saves if it does anything
         }
         return null;
     }
@@ -363,118 +383,108 @@ public class ForgeEventHandler {
      * @param craftingGridDiameterToFill - The size of the crafting grid to try filling with (1x1 or 2x2 or 3x3)
      */
     private void checkCondenserUpgrade(EntityItemPickupEvent event, ArrayList<ItemStack> backpackStacks, int craftingGridDiameterToFill){
-        boolean shouldSave = false;
-        if (!backpackStacks.isEmpty()){
-            CraftingManager craftingManager = CraftingManager.getInstance();
-            for (ItemStack backpack : backpackStacks) {
-                shouldSave = false;
-                if (!(event.entityPlayer.openContainer instanceof ContainerBackpack)) { //can't have the backpack open
+        if (backpackStacks.isEmpty() || isItemEntityEmpty(event) || event.entityPlayer == null || event.item == null || event.item.worldObj == null){
+            return;
+        }
 
-                    BackpackTypes type = BackpackTypes.values()[((ItemBackpack) backpack.getItem()).getGuiId()];
-                    ContainerBackpack container = new ContainerBackpack(event.entityPlayer, new InventoryBackpack(event.entityPlayer, backpack, type), type);
+        ContainerWorkbench containerWorkbench = new ContainerWorkbench(event.entityPlayer.inventory, event.item.worldObj, 0, 0, 0);
+        InventoryCrafting inventoryCrafting = new InventoryCrafting(containerWorkbench, 3, 3);
 
-                    container.sort(); //sort to make sure all items are in their smallest slot numbers possible
-                    if (container.getInventoryBackpack().getStackInSlot( //if the last slot has an item
-                            container.getInventoryBackpack().getSizeInventory()) != null){ //assume the backpack is full and stop trying to craft
-                        break; //TODO: test
+        for (ItemStack backpack : backpackStacks) {
+            if (backpack == null || isBackpackContainerOpen(event.entityPlayer)) {
+                continue;
+            }
+
+            BackpackTypes type = getBackpackType(backpack);
+            if (type == null) {
+                continue;
+            }
+
+            ContainerBackpack container = new ContainerBackpack(event.entityPlayer, new InventoryBackpack(event.entityPlayer, backpack, type), type);
+            container.sort(); //sort to make sure all items are in their smallest slot numbers possible
+
+            int lastSlotIndex = container.getInventoryBackpack().getSizeInventory() - 1;
+            if (lastSlotIndex >= 0 && container.getInventoryBackpack().getStackInSlot(lastSlotIndex) != null){ //backpack full, skip expensive crafting
+                continue;
+            }
+
+            ArrayList<ItemStack> condenserItems;
+            switch (craftingGridDiameterToFill){
+                case 1:
+                    condenserItems = UpgradeMethods.getCondenserTinyItems(backpack);
+                    break;
+                case 2:
+                    condenserItems = UpgradeMethods.getCondenserSmallItems(backpack);
+                    break;
+                case 3:
+                    condenserItems = UpgradeMethods.getCondenserItems(backpack);
+                    break;
+                default: //should be unreachable
+                    condenserItems = UpgradeMethods.getCondenserItems(backpack);
+                    Logger.error("IronBackpacks CraftingUpgrade Error, will probably give the wrong output");
+            }
+
+            boolean shouldSave = false;
+            for (ItemStack condenserItem : condenserItems) {
+                if (condenserItem == null) {
+                    continue;
+                }
+                for (int index = 0; index < type.getSize(); index++) {
+                    Slot theSlot = (Slot) container.getSlot(index);
+                    if (theSlot == null || !theSlot.getHasStack()) {
+                        continue;
+                    }
+                    ItemStack theStack = theSlot.getStack();
+                    if (theStack == null || theStack.stackSize < (craftingGridDiameterToFill * craftingGridDiameterToFill) || !IronBackpacksHelper.areItemsEqualForStacking(theStack, condenserItem)) {
+                        continue;
                     }
 
-                    ContainerWorkbench containerWorkbench = new ContainerWorkbench(event.entityPlayer.inventory, event.item.worldObj, 0, 0, 0);
-                    InventoryCrafting inventoryCrafting = new InventoryCrafting(containerWorkbench, 3, 3); //fake workbench/inventory for checking matching recipe
-
-                    ArrayList<ItemStack> condenserItems;
-                    switch (craftingGridDiameterToFill){
-                        case 1:
-                            condenserItems = UpgradeMethods.getCondenserTinyItems(backpack);
-                            break;
-                        case 2:
-                            condenserItems = UpgradeMethods.getCondenserSmallItems(backpack);
-                            break;
-                        case 3:
-                            condenserItems = UpgradeMethods.getCondenserItems(backpack);
-                            break;
-                        default: //should be unreachable
-                            condenserItems = UpgradeMethods.getCondenserItems(backpack);
-                            Logger.error("IronBackpacks CraftingUpgrade Error, will probably give the wrong output");
+                    ItemStack recipeOutput = getCachedRecipeOutput(theStack, craftingGridDiameterToFill, inventoryCrafting, event.item.worldObj);
+                    if (recipeOutput == null) {
+                        continue;
                     }
 
-                    for (ItemStack condenserItem : condenserItems) {
-                        if (condenserItem != null) {
-                            for (int index = 0; index < type.getSize(); index++) {
-                                Slot theSlot = (Slot) container.getSlot(index);
-                                if (theSlot!=null && theSlot.getHasStack()) {
-                                    ItemStack theStack = theSlot.getStack();
-                                    if (theStack != null && theStack.stackSize >= (craftingGridDiameterToFill*craftingGridDiameterToFill) && IronBackpacksHelper.areItemsEqualForStacking(theStack, condenserItem)) {
-                                        ItemStack myStack = new ItemStack(theStack.getItem(), 1, theStack.getItemDamage()); //stackSize of 1
-                                        if (craftingGridDiameterToFill == 2){//special handling needed to make it a square
-                                            inventoryCrafting.setInventorySlotContents(0, myStack);
-                                            inventoryCrafting.setInventorySlotContents(1, myStack);
-                                            inventoryCrafting.setInventorySlotContents(3, myStack);
-                                            inventoryCrafting.setInventorySlotContents(4, myStack);
-                                        }else {
-                                            for (int i = 0; i < (craftingGridDiameterToFill*craftingGridDiameterToFill); i++) {
-                                                inventoryCrafting.setInventorySlotContents(i, myStack); //crafting grid with a 1x1 (single item) or 3x3 square of the item
-                                            }
-                                        }
-                                        ItemStack recipeOutput = craftingManager.findMatchingRecipe(inventoryCrafting, event.item.worldObj);
-                                        if (recipeOutput != null) { //TODO: test math is correct here
+                    boolean crafted = false;
+                    int numberOfIterations = (int) Math.floor(theStack.stackSize / (craftingGridDiameterToFill * craftingGridDiameterToFill));
+                    int numberOfItems = recipeOutput.stackSize * numberOfIterations;
 
-                                            shouldSave = true;
-
-                                            int numberOfIterations = (int) Math.floor(theStack.stackSize / (craftingGridDiameterToFill * craftingGridDiameterToFill));
-                                            int numberOfItems = recipeOutput.stackSize * numberOfIterations;
-
-                                            if (numberOfItems > 64){ //multiple stacks, need to make sure there is room
-
-                                                //More efficient code [that doesn't work]
-//                                                int tempNumberOfItems = numberOfItems;
-//                                                int totalStacks = ((int)Math.ceil(numberOfItems / 64d));
-//                                                for (int numOfStacks = 0; numOfStacks < totalStacks; numOfStacks++) {
-//                                                    Logger.info("temp number of items: "+tempNumberOfItems);
-//                                                    ItemStack myRecipeOutput = new ItemStack(recipeOutput.getItem(), tempNumberOfItems, recipeOutput.getItemDamage());
-//                                                    if (container.transferStackInSlot(myRecipeOutput) != null) { //check if there is room to put them
-//                                                        int decrementAmount = tempNumberOfItems >= 64 ? 64 : tempNumberOfItems;
-//                                                        theSlot.decrStackSize(theStack.stackSize - ((int) Math.ceil(decrementAmount / recipeOutput.stackSize)));
-//                                                    }
-//                                                    tempNumberOfItems -= 64;
-//                                                }
-
-                                                //TODO: iterates an excessive amount, make it more efficient by using the basis of the code above
-                                                for (int i = 0; i < numberOfIterations; i++){ //for every possible crafting operation
-                                                    ItemStack myRecipeOutput = new ItemStack(recipeOutput.getItem(), recipeOutput.stackSize, recipeOutput.getItemDamage()); //get the output
-                                                    ItemStack stack = container.transferStackInSlot(myRecipeOutput); //try to put that output into the backpack
-                                                    if (stack == null){ //can't put it anywhere
-                                                        break;
-                                                    }else if (stack.stackSize != 0){ //remainder present, stack couldn't be fully transferred, undo the last operation
-                                                        Slot slot = container.getSlot(container.getType().getSize()-1); //last slot in pack
-                                                        slot.putStack(new ItemStack(recipeOutput.getItem(), recipeOutput.getMaxStackSize()-(recipeOutput.stackSize - stack.stackSize), recipeOutput.getItemDamage()));
-                                                        break;
-                                                    } else { //normal condition, stack was fully transferred
-                                                        theSlot.decrStackSize(1);
-                                                    }
-                                                }
-                                            }else {
-                                                ItemStack myRecipeOutput = new ItemStack(recipeOutput.getItem(), numberOfItems, recipeOutput.getItemDamage());
-                                                if (container.transferStackInSlot(myRecipeOutput) != null) {
-                                                    theSlot.decrStackSize(theStack.stackSize - (theStack.stackSize % (craftingGridDiameterToFill * craftingGridDiameterToFill)));
-                                                }
-                                                container.save(event.entityPlayer);
-                                            }
-
-                                        }
-                                    }
-                                }
+                    if (numberOfItems > 64){ //multiple stacks, need to make sure there is room
+                        for (int i = 0; i < numberOfIterations; i++){ //for every possible crafting operation
+                            ItemStack myRecipeOutput = new ItemStack(recipeOutput.getItem(), recipeOutput.stackSize, recipeOutput.getItemDamage()); //get the output
+                            ItemStack stack = container.transferStackInSlot(myRecipeOutput); //try to put that output into the backpack
+                            if (stack == null){ //can't put it anywhere
+                                break;
+                            }else if (stack.stackSize != 0){ //remainder present, stack couldn't be fully transferred, undo the last operation
+                                Slot slot = container.getSlot(container.getType().getSize()-1); //last slot in pack
+                                slot.putStack(new ItemStack(recipeOutput.getItem(), recipeOutput.getMaxStackSize()-(recipeOutput.stackSize - stack.stackSize), recipeOutput.getItemDamage()));
+                                crafted = true;
+                                break;
+                            } else { //normal condition, stack was fully transferred
+                                theSlot.decrStackSize(1);
+                                crafted = true;
                             }
                         }
+                    }else {
+                        ItemStack myRecipeOutput = new ItemStack(recipeOutput.getItem(), numberOfItems, recipeOutput.getItemDamage());
+                        if (container.transferStackInSlot(myRecipeOutput) != null) {
+                            theSlot.decrStackSize(theStack.stackSize - (theStack.stackSize % (craftingGridDiameterToFill * craftingGridDiameterToFill)));
+                            crafted = true;
+                        }
                     }
-                    if (shouldSave) { //TODO: test
-                        container.sort(); //sort items
-                        container.onContainerClosed(event.entityPlayer);
+
+                    if (crafted) {
+                        shouldSave = true;
+                        container.save(event.entityPlayer);
                     }
                 }
             }
+            if (shouldSave) { //TODO: test
+                container.sort(); //sort items
+                container.onContainerClosed(event.entityPlayer);
+            }
         }
     }
+
 
     //===================================================================Filter Upgrade======================================================================
 
@@ -484,43 +494,48 @@ public class ForgeEventHandler {
      * @param backpackStacks - the backpacks with a filter
      */
     private void checkFilterUpgrade(EntityItemPickupEvent event, ArrayList<ItemStack> backpackStacks){
-        if (!backpackStacks.isEmpty()){
-            for (ItemStack backpack : backpackStacks) {
-                BackpackTypes type = BackpackTypes.values()[((ItemBackpack) backpack.getItem()).getGuiId()];
-                ContainerBackpack container = new ContainerBackpack(event.entityPlayer, new InventoryBackpack(event.entityPlayer, backpack, type), type);
-                if (!(event.entityPlayer.openContainer instanceof ContainerBackpack)) { //can't have the backpack open
-                    int[] upgrades = IronBackpacksHelper.getUpgradesAppliedFromNBT(backpack);
-
-                    if (UpgradeMethods.hasFilterBasicUpgrade(upgrades))
-                        transferWithBasicFilter(UpgradeMethods.getBasicFilterItems(backpack), event, container);
-
-                    if (UpgradeMethods.hasFilterModSpecificUpgrade(upgrades))
-                        transferWithModSpecificFilter(UpgradeMethods.getModSpecificFilterItems(backpack), event, container);
-
-                    if (UpgradeMethods.hasFilterFuzzyUpgrade(upgrades))
-                        transferWithFuzzyFilter(UpgradeMethods.getFuzzyFilterItems(backpack), event, container);
-
-                    if (UpgradeMethods.hasFilterOreDictUpgrade(upgrades))
-                        transferWithOreDictFilter(UpgradeMethods.getOreDictFilterItems(backpack), getOreDict(event.item.getEntityItem()), event, container);
-
-                    if (UpgradeMethods.hasFilterAdvancedUpgrade(upgrades)) {
-                        ItemStack[] advFilterItems = UpgradeMethods.getAdvFilterAllItems(backpack);
-                        byte[] advFilterButtonStates = UpgradeMethods.getAdvFilterButtonStates(backpack);
-
-                        transferWithBasicFilter(UpgradeMethods.getAdvFilterBasicItems(advFilterItems, advFilterButtonStates), event, container);
-                        transferWithModSpecificFilter(UpgradeMethods.getAdvFilterModSpecificItems(advFilterItems, advFilterButtonStates), event, container);
-                        transferWithFuzzyFilter(UpgradeMethods.getAdvFilterFuzzyItems(advFilterItems, advFilterButtonStates), event, container);
-                        transferWithOreDictFilter(UpgradeMethods.getAdvFilterOreDictItems(advFilterItems, advFilterButtonStates), getOreDict(event.item.getEntityItem()), event, container);
-                    }
-
-                    if (UpgradeMethods.hasFilterMiningUpgrade(upgrades))
-                        transferWithMiningFilter(UpgradeMethods.getMiningFilterItems(backpack), getOreDict(event.item.getEntityItem()), event, container);
-
-                    if (UpgradeMethods.hasFilterVoidUpgrade(upgrades))
-                        deleteWithVoidFilter(UpgradeMethods.getVoidFilterItems(backpack), event);
-
-                }
+        if (isItemEntityEmpty(event) || backpackStacks.isEmpty()){
+            return;
+        }
+        for (ItemStack backpack : backpackStacks) {
+            BackpackTypes type = getBackpackType(backpack);
+            if (type == null) {
+                continue;
             }
+            ContainerBackpack container = new ContainerBackpack(event.entityPlayer, new InventoryBackpack(event.entityPlayer, backpack, type), type);
+            if (isBackpackContainerOpen(event.entityPlayer)) { //can't have the backpack open
+                continue;
+            }
+            int[] upgrades = IronBackpacksHelper.getUpgradesAppliedFromNBT(backpack);
+
+            if (UpgradeMethods.hasFilterBasicUpgrade(upgrades))
+                transferWithBasicFilter(UpgradeMethods.getBasicFilterItems(backpack), event, container);
+
+            if (UpgradeMethods.hasFilterModSpecificUpgrade(upgrades))
+                transferWithModSpecificFilter(UpgradeMethods.getModSpecificFilterItems(backpack), event, container);
+
+            if (UpgradeMethods.hasFilterFuzzyUpgrade(upgrades))
+                transferWithFuzzyFilter(UpgradeMethods.getFuzzyFilterItems(backpack), event, container);
+
+            if (UpgradeMethods.hasFilterOreDictUpgrade(upgrades))
+                transferWithOreDictFilter(UpgradeMethods.getOreDictFilterItems(backpack), getOreDict(event.item.getEntityItem()), event, container);
+
+            if (UpgradeMethods.hasFilterAdvancedUpgrade(upgrades)) {
+                ItemStack[] advFilterItems = UpgradeMethods.getAdvFilterAllItems(backpack);
+                byte[] advFilterButtonStates = UpgradeMethods.getAdvFilterButtonStates(backpack);
+
+                transferWithBasicFilter(UpgradeMethods.getAdvFilterBasicItems(advFilterItems, advFilterButtonStates), event, container);
+                transferWithModSpecificFilter(UpgradeMethods.getAdvFilterModSpecificItems(advFilterItems, advFilterButtonStates), event, container);
+                transferWithFuzzyFilter(UpgradeMethods.getAdvFilterFuzzyItems(advFilterItems, advFilterButtonStates), event, container);
+                transferWithOreDictFilter(UpgradeMethods.getAdvFilterOreDictItems(advFilterItems, advFilterButtonStates), getOreDict(event.item.getEntityItem()), event, container);
+            }
+
+            if (UpgradeMethods.hasFilterMiningUpgrade(upgrades))
+                transferWithMiningFilter(UpgradeMethods.getMiningFilterItems(backpack), getOreDict(event.item.getEntityItem()), event, container);
+
+            if (UpgradeMethods.hasFilterVoidUpgrade(upgrades))
+                deleteWithVoidFilter(UpgradeMethods.getVoidFilterItems(backpack), event);
+
         }
     }
 
@@ -531,6 +546,9 @@ public class ForgeEventHandler {
      * @param container - the backpack to transfer items into
      */
     private void transferWithBasicFilter(ArrayList<ItemStack> filterItems, EntityItemPickupEvent event, ContainerBackpack container){
+        if (isItemEntityEmpty(event)) {
+            return;
+        }
         boolean shouldSave = false;
         for (ItemStack filterItem : filterItems) {
             if (filterItem != null) {
@@ -550,6 +568,9 @@ public class ForgeEventHandler {
      * @param container - the backpack to transfer items into
      */
     private void transferWithFuzzyFilter(ArrayList<ItemStack> filterItems, EntityItemPickupEvent event, ContainerBackpack container){
+        if (isItemEntityEmpty(event)) {
+            return;
+        }
         boolean shouldSave = false;
         for (ItemStack filterItem : filterItems) {
             if (filterItem != null) {
@@ -570,6 +591,9 @@ public class ForgeEventHandler {
      * @param container - the backpack to move items into
      */
     private void transferWithOreDictFilter(ArrayList<ItemStack> filterItems, ArrayList<String> itemEntityOre, EntityItemPickupEvent event, ContainerBackpack container){
+        if (isItemEntityEmpty(event)) {
+            return;
+        }
         boolean shouldSave = false;
         for (ItemStack filterItem : filterItems) {
             if (filterItem != null) {
@@ -594,11 +618,15 @@ public class ForgeEventHandler {
      * @param container - the backpack to move the items into
      */
     private void transferWithModSpecificFilter(ArrayList<ItemStack> filterItems, EntityItemPickupEvent event, ContainerBackpack container){
+        if (isItemEntityEmpty(event)) {
+            return;
+        }
         boolean shouldSave = false;
+        String eventModId = getModId(event.item.getEntityItem());
         for (ItemStack filterItem : filterItems) {
             if (filterItem != null) {
-                //if modId1 == modId2 same mod so transfer d
-                if (GameRegistry.findUniqueIdentifierFor(event.item.getEntityItem().getItem()).modId.equals(GameRegistry.findUniqueIdentifierFor(filterItem.getItem()).modId)){
+                String filterModId = getModId(filterItem);
+                if (eventModId != null && eventModId.equals(filterModId)){
                     container.transferStackInSlot(event.item.getEntityItem());
                     shouldSave = true;
                 }
@@ -614,6 +642,9 @@ public class ForgeEventHandler {
      * @param container - the backpack to move the items into
      */
     private void transferWithMiningFilter(ArrayList<ItemStack> filterItems, ArrayList<String> itemEntityOre, EntityItemPickupEvent event, ContainerBackpack container){
+        if (isItemEntityEmpty(event)) {
+            return;
+        }
         boolean shouldSave = false;
         transferWithBasicFilter(filterItems, event, container);
         if (itemEntityOre != null) {
@@ -634,6 +665,9 @@ public class ForgeEventHandler {
      * @param event - EntityItemPickupEvent
      */
     private void deleteWithVoidFilter(ArrayList<ItemStack> filterItems, EntityItemPickupEvent event){
+        if (isItemEntityEmpty(event)) {
+            return;
+        }
         for (ItemStack stack : filterItems) {
             if (stack != null) {
                 if (IronBackpacksHelper.areItemsEqualForStacking(stack, event.item.getEntityItem())){ //if same item
@@ -651,19 +685,192 @@ public class ForgeEventHandler {
      * @return - OreDict entries in string form, null if no entries
      */
     private ArrayList<String> getOreDict(ItemStack itemStack){
+        if (itemStack == null || itemStack.getItem() == null) {
+            return null;
+        }
+        ItemStackKey key = new ItemStackKey(itemStack);
+        if (ORE_DICT_CACHE.containsKey(key)) {
+            return new ArrayList<String>(ORE_DICT_CACHE.get(key));
+        }
+        if (EMPTY_ORE_DICT_CACHE.contains(key)) {
+            return null;
+        }
         int[] ids = OreDictionary.getOreIDs(itemStack);
         ArrayList<String> retList = new ArrayList<String>();
         if (ids.length > 0){
             for (int i = 0; i < ids.length; i++) {
-                if (i > 0 && !retList.contains(OreDictionary.getOreName(ids[i]))) { //no duplicates
-                    retList.add(OreDictionary.getOreName(ids[i]));
-                }else{
-                    retList.add(OreDictionary.getOreName(ids[i]));
+                String oreName = OreDictionary.getOreName(ids[i]);
+                if (oreName != null && (i == 0 || !retList.contains(oreName))) {
+                    retList.add(oreName);
                 }
             }
         }
-        return retList.isEmpty() ? null : retList;
+        if (retList.isEmpty()) {
+            EMPTY_ORE_DICT_CACHE.add(key);
+            return null;
+        }
+        ArrayList<String> cached = new ArrayList<String>(retList);
+        ORE_DICT_CACHE.put(key, cached);
+        return new ArrayList<String>(cached);
     }
 
+    private boolean isItemEntityEmpty(EntityItemPickupEvent event) {
+        return event.item == null || event.item.isDead || event.item.getEntityItem() == null || event.item.getEntityItem().stackSize <= 0;
+    }
+
+    private boolean isBackpackContainerOpen(EntityPlayer player) {
+        return player != null && player.openContainer instanceof ContainerBackpack;
+    }
+
+    private BackpackTypes getBackpackType(ItemStack stack) {
+        if (stack == null || !(stack.getItem() instanceof ItemBackpack)) {
+            return null;
+        }
+        ItemBackpack itemBackpack = (ItemBackpack) stack.getItem();
+        int guiId = itemBackpack.getGuiId();
+        if (guiId < 0 || guiId >= BACKPACK_TYPES.length) {
+            return null;
+        }
+        return BACKPACK_TYPES[guiId];
+    }
+
+    private BackpackTypes getBackpackTypeByItemId(int itemId) {
+        int index = itemId - 1;
+        if (index < 0 || index >= BACKPACK_TYPES.length) {
+            return null;
+        }
+        return BACKPACK_TYPES[index];
+    }
+
+    private String getModId(ItemStack stack) {
+        if (stack == null || stack.getItem() == null) {
+            return null;
+        }
+        ItemStackKey key = new ItemStackKey(stack);
+        if (MOD_ID_CACHE.containsKey(key)) {
+            return MOD_ID_CACHE.get(key);
+        }
+        GameRegistry.UniqueIdentifier identifier = GameRegistry.findUniqueIdentifierFor(stack.getItem());
+        String modId = identifier == null ? null : identifier.modId;
+        MOD_ID_CACHE.put(key, modId);
+        return modId;
+    }
+
+    private ItemStack getCachedRecipeOutput(ItemStack stack, int craftingGridDiameterToFill, InventoryCrafting inventoryCrafting, net.minecraft.world.World world) {
+        if (stack == null || stack.getItem() == null || world == null || inventoryCrafting == null) {
+            return null;
+        }
+        RecipeKey key = new RecipeKey(stack, craftingGridDiameterToFill);
+        if (RECIPE_CACHE.containsKey(key)) {
+            ItemStack cached = RECIPE_CACHE.get(key);
+            return cached == null ? null : cached.copy();
+        }
+
+        clearInventoryCrafting(inventoryCrafting);
+        ItemStack myStack = new ItemStack(stack.getItem(), 1, stack.getItemDamage());
+        int maxSlots = craftingGridDiameterToFill * craftingGridDiameterToFill;
+        if (craftingGridDiameterToFill == 2) {
+            inventoryCrafting.setInventorySlotContents(0, myStack);
+            inventoryCrafting.setInventorySlotContents(1, myStack);
+            inventoryCrafting.setInventorySlotContents(3, myStack);
+            inventoryCrafting.setInventorySlotContents(4, myStack);
+        } else {
+            for (int i = 0; i < maxSlots; i++) {
+                inventoryCrafting.setInventorySlotContents(i, myStack);
+            }
+        }
+
+        ItemStack recipeOutput = CraftingManager.getInstance().findMatchingRecipe(inventoryCrafting, world);
+        clearInventoryCrafting(inventoryCrafting);
+
+        if (recipeOutput != null) {
+            ItemStack cacheValue = recipeOutput.copy();
+            RECIPE_CACHE.put(key, cacheValue);
+            return recipeOutput.copy();
+        }
+
+        RECIPE_CACHE.put(key, null);
+        return null;
+    }
+
+    private void clearInventoryCrafting(InventoryCrafting inventoryCrafting) {
+        for (int i = 0; i < inventoryCrafting.getSizeInventory(); i++) {
+            inventoryCrafting.setInventorySlotContents(i, null);
+        }
+    }
+
+    private static class ItemStackKey {
+        private final Item item;
+        private final int damage;
+        private final NBTTagCompound tag;
+        private final int hashCode;
+
+        private ItemStackKey(ItemStack stack) {
+            this.item = stack.getItem();
+            this.damage = stack.getItemDamage();
+            this.tag = stack.hasTagCompound() ? (NBTTagCompound) stack.getTagCompound().copy() : null;
+            int result = Item.getIdFromItem(this.item);
+            result = 31 * result + this.damage;
+            result = 31 * result + (this.tag != null ? this.tag.hashCode() : 0);
+            this.hashCode = result;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof ItemStackKey)) {
+                return false;
+            }
+            ItemStackKey other = (ItemStackKey) obj;
+            if (this.item != other.item || this.damage != other.damage) {
+                return false;
+            }
+            if (this.tag == null) {
+                return other.tag == null;
+            }
+            return this.tag.equals(other.tag);
+        }
+
+        @Override
+        public int hashCode() {
+            return this.hashCode;
+        }
+    }
+
+    private static class RecipeKey {
+        private final ItemStackKey itemKey;
+        private final int gridDiameter;
+        private final int hashCode;
+
+        private RecipeKey(ItemStack stack, int gridDiameter) {
+            this.itemKey = new ItemStackKey(stack);
+            this.gridDiameter = gridDiameter;
+            int result = this.itemKey.hashCode();
+            result = 31 * result + this.gridDiameter;
+            this.hashCode = result;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof RecipeKey)) {
+                return false;
+            }
+            RecipeKey other = (RecipeKey) obj;
+            if (this.gridDiameter != other.gridDiameter) {
+                return false;
+            }
+            return this.itemKey.equals(other.itemKey);
+        }
+
+        @Override
+        public int hashCode() {
+            return this.hashCode;
+        }
+    }
 
 }
